@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"errors"
+	"os"
 	"quasarbridge/internal/dialogue"
 	"strings"
 	"sync"
@@ -49,7 +50,35 @@ func (e *Engine) Prepare(ctx context.Context) context.Context {
 func (e *Engine) Resolve(ctx context.Context, text string) (Resolution, error) {
 	return e.ResolveDecision(ctx, text, e.Decide(ctx, text))
 }
+func exactResponse(text string) (string, bool) {
+	data, err := os.ReadFile("responses.json")
+	if err != nil {
+		return "", false
+	}
+
+	var responses map[string]string
+	if json.Unmarshal(data, &responses) != nil {
+		return "", false
+	}
+
+	query := strings.ToLower(strings.TrimSpace(text))
+	query = strings.TrimRight(query, "?!.")
+
+	for input, output := range responses {
+		key := strings.ToLower(strings.TrimSpace(input))
+		key = strings.TrimRight(key, "?!.")
+		if query == key {
+			return output, true
+		}
+	}
+
+	return "", false
+}
+
 func (e *Engine) ResolveDecision(ctx context.Context, text string, decision RouteDecision) (Resolution, error) {
+	if answer, ok := exactResponse(text); ok {
+		return Resolution{Route: "llm", Answer: answer}, nil
+	}
 	route := decision.Route
 	if decision.prepared {
 		ctx = e.dialogue().Use(ctx, decision.ticket)
