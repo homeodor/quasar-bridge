@@ -59,7 +59,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []Tool) (Me
 func (c *Client) chat(ctx context.Context, messages []Message, structured bool, tools []Tool) (Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	request := map[string]any{"model": c.Model, "messages": messages, "stream": false, "max_tokens": 1024, "temperature": 0, "chat_template_kwargs": map[string]any{"enable_thinking": false}}
+	request := map[string]any{"model": c.Model, "messages": messages, "stream": false, "max_completion_tokens": 1024, "reasoning_effort": "none"}
 	if len(tools) > 0 {
 		request["tools"] = tools
 		request["tool_choice"] = "auto"
@@ -93,7 +93,8 @@ func (c *Client) chat(ctx context.Context, messages []Message, structured bool, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return Message{}, fmt.Errorf("LLM returned HTTP %d", resp.StatusCode)
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return Message{}, fmt.Errorf("LLM returned HTTP %d: %s", resp.StatusCode, string(data))
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
