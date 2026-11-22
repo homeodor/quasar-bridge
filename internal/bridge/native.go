@@ -464,6 +464,11 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 	switch f.Kind() {
 	case "AliceResponse":
 		if !p.cloud {
+			if r := e.GetAliceResponse(); r != nil && canReplaceResponse(r) {
+				n.mu.Unlock()
+				slog.Info("native_approval_placeholder_ignored", "request", requestTag(p.id))
+				return nil
+			}
 			p.canceled = true
 			p.cancel()
 			slog.Warn("native_approval_not_honored", "request", requestTag(p.id))
@@ -516,6 +521,11 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 			if routed, ok := n.resolver.(RoutedResolver); ok {
 				decision := routed.Decide(p.ctx, text)
 				slog.Info("native_route_decision", "request", requestTag(p.id), "route", decision.Route, "source", decision.Source)
+				if decision.Route != "yandex" {
+					n.mu.Lock()
+					p.local = true
+					n.mu.Unlock()
+				}
 				stop := func() {}
 				if decision.Route != "yandex" && n.ProgressAfter > 0 {
 					stop = n.progress(p)
@@ -658,7 +668,13 @@ func (n *Native) ack(p *nativeRequest) error {
 
 func canReplaceResponse(r *response.TAliceResponseProto) bool {
 	for _, d := range r.GetResponse().GetDirectives() {
-		if d.GetType() != "client_action" || d.GetName() != "tts_play_placeholder" {
+		if d.GetType() != "client_action" {
+			return false
+		}
+		switch d.GetName() {
+		case "tts_play_placeholder", "draw_animation_directive":
+			// Harmless placeholder/UI directives observed on Yandex Station Midi.
+		default:
 			return false
 		}
 	}
