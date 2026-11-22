@@ -20,6 +20,13 @@ type Completer interface {
 type HomeHandler interface {
 	Handle(context.Context, string) (string, error)
 }
+
+// ScriptHandler discovers only Assist-exposed scripts and runs a selected ID.
+// Discovery never actuates; RunScript must revalidate the selection.
+type ScriptHandler interface {
+	FindScripts(context.Context, string) ([]string, error)
+	RunScript(context.Context, string, string) (string, error)
+}
 type Engine struct {
 	LLM          Completer
 	Assistant    Completer
@@ -76,9 +83,6 @@ func exactResponse(text string) (string, bool) {
 }
 
 func (e *Engine) ResolveDecision(ctx context.Context, text string, decision RouteDecision) (Resolution, error) {
-	if answer, ok := exactResponse(text); ok {
-		return Resolution{Route: "llm", Answer: answer}, nil
-	}
 	route := decision.Route
 	if decision.prepared {
 		ctx = e.dialogue().Use(ctx, decision.ticket)
@@ -92,6 +96,29 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 
 	if !e.dialogue().Current(ctx, ticket) {
 		return Resolution{Route: route}, context.Canceled
+	}
+	if decision.Source == "script_exact" || decision.Source == "script_lookup_error" {
+		result := Resolution{Route: "home"}
+		if !e.dialogue().Clear(ctx, ticket) {
+			return result, context.Canceled
+		}
+		if decision.scriptErr != nil {
+			return result, decision.scriptErr
+		}
+		if len(decision.scriptIDs) != 1 {
+			result.Answer = "Нашлось несколько скриптов с таким названием. Задайте им разные названия в Home Assistant."
+			return result, nil
+		}
+		handler, ok := e.Home.(ScriptHandler)
+		if !ok {
+			return result, errors.New("script handler is not configured")
+		}
+		answer, err := handler.RunScript(ctx, text, decision.scriptIDs[0])
+		result.Answer = answer
+		return result, err
+	}
+	if answer, ok := exactResponse(text); ok {
+		return Resolution{Route: "llm", Answer: answer}, nil
 	}
 	if decision.Source == "dialogue_reset" {
 		if !e.dialogue().Clear(ctx, ticket) {
@@ -199,6 +226,19 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 		decision.ticket = ticket
 		decision.prepared = true
 	}()
+	if ctx.Err() != nil || !e.dialogue().Current(ctx, ticket) {
+		return RouteDecision{Route: "home", Source: "script_lookup_error", scriptErr: context.Canceled}
+	}
+	if scripts, ok := e.Home.(ScriptHandler); ok {
+		ids, err := scripts.FindScripts(ctx, text)
+		if err != nil {
+			// An incomplete inventory cannot establish a safe nonmatch.
+			return RouteDecision{Route: "home", Source: "script_lookup_error", scriptErr: err}
+		}
+		if len(ids) > 0 {
+			return RouteDecision{Route: "home", Source: "script_exact", scriptIDs: ids}
+		}
+	}
 	p := e.policy()
 	if dialogue.IsReset(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue_reset"}
