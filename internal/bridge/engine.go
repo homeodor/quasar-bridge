@@ -17,6 +17,9 @@ import (
 type Completer interface {
 	Complete(context.Context, []llm.Message, bool) (string, error)
 }
+type HomeDialogueHandler interface {
+	HandleDialogue(context.Context, string, []llm.Message) (dialogue.Reply, error)
+}
 type HomeHandler interface {
 	Handle(context.Context, string) (string, error)
 }
@@ -89,7 +92,7 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 	} else {
 		ctx = e.Prepare(ctx)
 	}
-	_, _, ticket := e.dialogue().Start(ctx)
+	_, snapshot, ticket := e.dialogue().Start(ctx)
 	if ctx.Err() != nil {
 		return Resolution{Route: route}, ctx.Err()
 	}
@@ -117,16 +120,24 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 		result.Answer = answer
 		return result, err
 	}
-	if answer, ok := exactResponse(text); ok {
-		return Resolution{Route: "llm", Answer: answer}, nil
-	}
-	if decision.Source == "dialogue_reset" {
+	if snapshot.AwaitingRoute == "home" && decision.Source != "home_clarification" {
 		if !e.dialogue().Clear(ctx, ticket) {
 			return Resolution{Route: route}, context.Canceled
 		}
+	}
+	if answer, ok := exactResponse(text); ok {
+		return Resolution{Route: "llm", Answer: answer}, nil
+	}
+	if decision.Source == "dialogue_reset" || decision.Source == "dialogue_cancel" {
+		if !e.dialogue().Clear(ctx, ticket) {
+			return Resolution{Route: route}, context.Canceled
+		}
+		if decision.Source == "dialogue_cancel" {
+			return Resolution{Route: "llm", Answer: "Хорошо, отменено."}, nil
+		}
 		return Resolution{Route: "llm", Answer: "Начинаем новый разговор."}, nil
 	}
-	if route != "llm" && !e.dialogue().Clear(ctx, ticket) {
+	if route != "llm" && decision.Source != "home_clarification" && !e.dialogue().Clear(ctx, ticket) {
 		return Resolution{Route: route}, context.Canceled
 	}
 	result := Resolution{Route: route}
@@ -135,8 +146,29 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 		if e.Home == nil {
 			return Resolution{Route: "yandex"}, nil
 		}
-		answer, err := e.Home.Handle(ctx, text)
-		result.Answer = answer
+		var reply dialogue.Reply
+		var err error
+		if handler, ok := e.Home.(HomeDialogueHandler); ok {
+			var history []llm.Message
+			if decision.Source == "home_clarification" {
+				history = snapshot.Messages
+			}
+			reply, err = handler.HandleDialogue(ctx, text, history)
+		} else {
+			reply.Answer, err = e.Home.Handle(ctx, text)
+		}
+		if !e.dialogue().Current(ctx, ticket) {
+			return result, context.Canceled
+		}
+		result.Answer = reply.Answer
+		result.ShouldListen = err == nil && reply.ShouldListen
+		if result.ShouldListen {
+			if !e.dialogue().CommitWithContinuation(ctx, ticket, text, reply.Answer, false, "home") {
+				return result, context.Canceled
+			}
+		} else if !e.dialogue().Clear(ctx, ticket) {
+			return result, context.Canceled
+		}
 		return result, err
 	case "llm":
 		return e.Fallback(ctx, text)
@@ -157,7 +189,7 @@ func (e *Engine) Fallback(ctx context.Context, text string) (Resolution, error) 
 	if !e.dialogue().Current(ctx, ticket) {
 		return r, context.Canceled
 	}
-	messages := []llm.Message{{Role: "system", Content: "Ты голосовой помощник пользователя. Отвечай по-русски, кратко и по существу, обычно до трёх предложений. Ответ будет прочитан вслух: без Markdown и служебных рассуждений. Выполняй внешние действия только доступными инструментами по явному запросу пользователя. Не заявляй о выполнении действий без успешного результата инструмента; если инструмента нет, прямо скажи об этом. Для Home Assistant есть отдельный обработчик умного дома."}}
+	messages := []llm.Message{{Role: "system", Content: "Ты голосовой помощник пользователя. Отвечай по-русски, кратко и по существу, обычно до трёх предложений. Ответ будет прочитан вслух: без Markdown и служебных рассуждений. Выполняй внешние действия только доступными инструментами по явному запросу пользователя. Не заявляй о выполнении действий без успешного результата инструмента; если инструмента нет, прямо скажи об этом. Для Home Assistant есть отдельный обработчик умного дома. Если требуется уточнение, задай один короткий вопрос и закончи его вопросительным знаком."}}
 	messages = append(messages, snapshot.Messages...)
 	messages = append(messages, llm.Message{Role: "user", Content: text})
 	private := snapshot.PrivateHistory
@@ -174,7 +206,12 @@ func (e *Engine) Fallback(ctx context.Context, text string) (Resolution, error) 
 		return r, context.Canceled
 	}
 	if err == nil {
-		if !e.dialogue().Commit(ctx, ticket, text, answer, private) {
+		continuation := ""
+		r.ShouldListen = dialogue.WantsReply(answer)
+		if r.ShouldListen {
+			continuation = "llm"
+		}
+		if !e.dialogue().CommitWithContinuation(ctx, ticket, text, answer, private, continuation) {
 			return r, context.Canceled
 		}
 	}
@@ -243,8 +280,17 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 	if dialogue.IsReset(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue_reset"}
 	}
+	if snapshot.AwaitingRoute != "" && dialogue.IsCancel(text) {
+		return RouteDecision{Route: "llm", Source: "dialogue_cancel"}
+	}
 	if d, ok := p.match(text); ok {
 		return d
+	}
+	if snapshot.AwaitingRoute == "home" {
+		return RouteDecision{Route: "home", Source: "home_clarification"}
+	}
+	if snapshot.AwaitingRoute == "llm" {
+		return RouteDecision{Route: "llm", Source: "llm_clarification"}
 	}
 	if len(snapshot.Messages) > 0 && dialogue.IsFollowup(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue"}

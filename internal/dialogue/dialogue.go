@@ -44,13 +44,23 @@ type turn struct {
 	user, answer string
 	private      bool
 }
+
+// Reply carries conversational intent separately from spoken text.
+type Reply struct {
+	Answer       string
+	ShouldListen bool
+}
+
 type entry struct {
-	turns      []turn
-	at         time.Time
-	generation uint64
-	pending    bool
+	awaitingRoute string
+	awaitingUntil time.Time
+	turns         []turn
+	at            time.Time
+	generation    uint64
+	pending       bool
 }
 type Snapshot struct {
+	AwaitingRoute  string
 	Messages       []llm.Message
 	PrivateHistory bool
 }
@@ -75,9 +85,24 @@ func New(cfg Config) *Store { return &Store{cfg: cfg, entries: map[string]*entry
 func (s *Store) expired(e *entry) bool {
 	return s.now().Sub(e.at) >= time.Duration(s.cfg.TTLSeconds)*time.Second
 }
+
+// An expired home question must not become generic LLM context. For LLM
+// questions, only the waiting marker expires; ordinary history keeps its TTL.
+func (s *Store) expireContinuation(e *entry) {
+	if e == nil || e.awaitingUntil.IsZero() || s.now().Before(e.awaitingUntil) {
+		return
+	}
+	if e.awaitingRoute == "home" {
+		e.turns = nil
+	}
+	e.awaitingRoute = ""
+	e.awaitingUntil = time.Time{}
+}
+
 func snapshot(e *entry) Snapshot {
 	var v Snapshot
 	if e != nil {
+		v.AwaitingRoute = e.awaitingRoute
 		for _, t := range e.turns {
 			v.Messages = append(v.Messages, llm.Message{Role: "user", Content: t.user}, llm.Message{Role: "assistant", Content: t.answer})
 			v.PrivateHistory = v.PrivateHistory || t.private
@@ -92,8 +117,11 @@ func (s *Store) View(ctx context.Context) Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.entries[key(ctx)]
+	s.expireContinuation(e)
 	if e != nil && s.expired(e) {
 		e.turns = nil
+		e.awaitingRoute = ""
+		e.awaitingUntil = time.Time{}
 		if !e.pending {
 			delete(s.entries, key(ctx))
 			e = nil
@@ -108,8 +136,11 @@ func (s *Store) Begin(ctx context.Context) (Snapshot, Ticket) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, e := range s.entries {
+		s.expireContinuation(e)
 		if s.expired(e) {
 			e.turns = nil
+			e.awaitingRoute = ""
+			e.awaitingUntil = time.Time{}
 			if !e.pending {
 				delete(s.entries, k)
 			}
@@ -133,6 +164,8 @@ func (s *Store) Begin(ctx context.Context) (Snapshot, Ticket) {
 	}
 	if s.expired(e) {
 		e.turns = nil
+		e.awaitingRoute = ""
+		e.awaitingUntil = time.Time{}
 	}
 	e.pending = true
 	s.generation++
@@ -141,6 +174,12 @@ func (s *Store) Begin(ctx context.Context) (Snapshot, Ticket) {
 	return snapshot(e), Ticket{key: k, generation: e.generation}
 }
 func (s *Store) Commit(ctx context.Context, ticket Ticket, user, answer string, private bool) bool {
+	return s.CommitWithContinuation(ctx, ticket, user, answer, private, "")
+}
+
+// CommitWithContinuation remembers only an unanswered turn. The waiting window
+// is capped at one minute; normal dialogue history keeps its configured TTL.
+func (s *Store) CommitWithContinuation(ctx context.Context, ticket Ticket, user, answer string, private bool, route string) bool {
 	if s == nil || !s.cfg.Enabled {
 		return ctx.Err() == nil
 	}
@@ -154,13 +193,21 @@ func (s *Store) Commit(ctx context.Context, ticket Ticket, user, answer string, 
 		return false
 	}
 	e.pending = false
+	e.awaitingRoute = ""
+	e.awaitingUntil = time.Time{}
 	e.at = s.now()
 	if strings.TrimSpace(answer) == "" {
 		return true
 	}
 	if utf8.RuneCountInString(user)+utf8.RuneCountInString(answer) > s.cfg.MaxChars {
 		e.turns = nil
+		e.awaitingRoute = ""
+		e.awaitingUntil = time.Time{}
 		return true
+	}
+	if route != "" {
+		e.awaitingRoute = route
+		e.awaitingUntil = s.now().Add(min(time.Duration(s.cfg.TTLSeconds)*time.Second, time.Minute))
 	}
 	e.turns = append(e.turns, turn{user: user, answer: answer, private: private})
 	e.at = s.now()
@@ -250,5 +297,33 @@ func (s *Store) Clear(ctx context.Context, ticket Ticket) bool {
 		return false
 	}
 	s.entries[ticket.key].turns = nil
+	s.entries[ticket.key].awaitingRoute = ""
+	s.entries[ticket.key].awaitingUntil = time.Time{}
 	return true
+}
+
+// WantsReply is a fallback for plain-text LLM answers. HA uses structured
+// clarification metadata, which also supports questions without a question mark.
+func WantsReply(text string) bool {
+	return strings.HasSuffix(strings.TrimRight(strings.TrimSpace(text), "»”\"'"), "?")
+}
+
+func IsCancel(text string) bool {
+	switch Normalize(text) {
+	case "отмена", "отмени", "не надо", "не нужно", "нет", "ничего не надо", "стоп", "забудь":
+		return true
+	}
+	return false
+}
+
+// CheckCurrent prevents a late action plan from executing after a newer turn.
+// Standalone handlers without a dialogue ticket still honor cancellation.
+func CheckCurrent(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if request, ok := ctx.Value(requestKey{}).(requestState); ok && !request.store.Current(ctx, request.ticket) {
+		return context.Canceled
+	}
+	return nil
 }

@@ -29,8 +29,9 @@ import (
 )
 
 type Resolution struct {
-	Route  string
-	Answer string
+	ShouldListen bool
+	Route        string
+	Answer       string
 }
 type Resolver interface {
 	Resolve(context.Context, string) (Resolution, error)
@@ -453,7 +454,7 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 					result.Answer = "Сейчас не получилось получить ответ локальной модели."
 				}
 				_ = n.sendCancel(p.ctx, p.id)
-				if err := n.reply(p, result.Answer); err != nil {
+				if err := n.reply(p, result.Answer, result.ShouldListen && err == nil); err != nil {
 					slog.Warn("native_reply_failed", "request", requestTag(p.id))
 				}
 				slog.Info("native_fallback", "request", requestTag(p.id), "route", "llm")
@@ -592,7 +593,7 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 				return
 			}
 		}
-		if err := n.reply(p, result.Answer); err != nil {
+		if err := n.reply(p, result.Answer, result.ShouldListen && err == nil); err != nil {
 			slog.Warn("native_reply_failed", "request", requestTag(p.id))
 		}
 	})
@@ -605,15 +606,16 @@ func (n *Native) sendCancel(ctx context.Context, id string) error {
 	}
 	return n.up(ctx, websocket.MessageBinary, b)
 }
-func (n *Native) reply(p *nativeRequest, text string) error {
+func (n *Native) reply(p *nativeRequest, text string, shouldListen bool) error {
+	slog.Info("native_local_reply", "request", requestTag(p.id), "should_listen", shouldListen, "streaming", p.streaming)
 	if p.streaming {
-		return n.finishDeferred(p, text)
+		return n.finishDeferred(p, text, shouldListen)
 	}
 	requestID := p.request.GetHeader().GetRequestId()
 	if requestID == "" {
 		requestID = p.id
 	}
-	answer := &response.TAliceResponseProto{Header: &response.TAliceResponseProto_THeader{RequestId: new(requestID), ResponseId: new(newID()), DialogId: new(p.request.GetHeader().GetDialogId()), SequenceNumber: new(p.request.GetHeader().GetSequenceNumber())}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new(text)}, HasVoiceResponse: true}, Response: &response.TAliceResponseProto_TResponse{Cards: []*response.TAliceResponseProto_TResponse_TCard{{Type: "simple_text", Text: new(text), CardId: new(newID())}}}}
+	answer := &response.TAliceResponseProto{Header: &response.TAliceResponseProto_THeader{RequestId: new(requestID), ResponseId: new(newID()), DialogId: new(p.request.GetHeader().GetDialogId()), SequenceNumber: new(p.request.GetHeader().GetSequenceNumber())}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new(text)}, HasVoiceResponse: true, ShouldListen: shouldListen}, Response: &response.TAliceResponseProto_TResponse{Cards: []*response.TAliceResponseProto_TResponse_TCard{{Type: "simple_text", Text: new(text), CardId: new(newID())}}}}
 	m := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{MessageId: newID(), RefMessageId: p.id}, Event: &server.TServerMessage_TEvent_AliceResponse{AliceResponse: answer}}}}
 	b, err := (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
 	if err != nil {

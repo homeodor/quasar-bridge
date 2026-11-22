@@ -73,7 +73,7 @@ func (n *Native) progress(p *nativeRequest) func() {
 			case <-p.ctx.Done():
 				return
 			case <-ticker.C:
-				if err := n.deferredPart(p, "", false); err != nil {
+				if err := n.deferredPart(p, "", false, false); err != nil {
 					p.cancel()
 					return
 				}
@@ -98,18 +98,18 @@ func (n *Native) beginDeferred(p *nativeRequest) error {
 	if err := n.down(p.ctx, websocket.MessageBinary, b); err != nil {
 		return err
 	}
-	if err := n.deferredPart(p, "", false); err != nil {
+	if err := n.deferredPart(p, "", false, false); err != nil {
 		return err
 	}
 	// Obtain the provider's actual Opus headers; its speech payload is discarded.
 	return n.synthesize(p, "а")
 }
-func (n *Native) deferredPart(p *nativeRequest, text string, last bool) error {
+func (n *Native) deferredPart(p *nativeRequest, text string, last, shouldListen bool) error {
 	if err := p.ctx.Err(); err != nil {
 		return err
 	}
 	p.partial++
-	base := &deferred.TDeferedAliceResponseProto_TBaseResponse{}
+	base := &deferred.TDeferedAliceResponseProto_TBaseResponse{ShouldListen: last && shouldListen}
 	if text != "" {
 		base.Text = new(text)
 	}
@@ -126,7 +126,7 @@ func (n *Native) deferredPart(p *nativeRequest, text string, last bool) error {
 	}
 	return n.down(p.ctx, websocket.MessageBinary, b)
 }
-func (n *Native) finishDeferred(p *nativeRequest, text string) error {
+func (n *Native) finishDeferred(p *nativeRequest, text string, shouldListen bool) error {
 	select {
 	case <-p.ctx.Done():
 		return p.ctx.Err()
@@ -136,7 +136,7 @@ func (n *Native) finishDeferred(p *nativeRequest, text string) error {
 	p.ttsID = newID()
 	n.tts[p.ttsID] = p
 	n.mu.Unlock()
-	if err := n.deferredPart(p, text, true); err != nil {
+	if err := n.deferredPart(p, text, true, shouldListen); err != nil {
 		return err
 	}
 	return n.synthesize(p, text)
